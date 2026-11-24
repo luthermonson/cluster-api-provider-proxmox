@@ -280,6 +280,15 @@ func ensureVirtualMachine(ctx context.Context, machineScope *scope.MachineScope)
 			return true, nil
 		}
 
+		// The clone of an earlier pass may have run while the status update recording its
+		// ID was rejected (a rejected patch loses spec.virtualMachineID and status.taskRef
+		// together). Cloning again would leave that VM behind, so a VM that already carries
+		// this machine's name is adopted instead: one list call per clone attempt.
+		adopted, err := adoptVMByName(ctx, machineScope)
+		if err != nil || adopted {
+			return adopted, err
+		}
+
 		// Create the VM.
 		resp, err := createVM(ctx, machineScope)
 		if err != nil {
@@ -331,6 +340,37 @@ func ensureVirtualMachine(ctx context.Context, machineScope *scope.MachineScope)
 
 	// at this point the VM is found, so err must be nil
 	return false, nil
+}
+
+// adoptVMByName looks for a VM named after the machine and, when there is one, records it as
+// the machine's VM the way a fresh clone is recorded: VMID, node, node location and the Cloning
+// reason, from which the state machine carries on. It reports whether a VM was adopted. The
+// next pass reads the VM under its ID and checks the name again (FindVM).
+func adoptVMByName(ctx context.Context, scope *scope.MachineScope) (bool, error) {
+	rsc, err := scope.InfraCluster.ProxmoxClient.FindVMByName(ctx, scope.Name())
+	if err != nil {
+		return false, errors.Wrapf(err, "unable to look for an existing vm named %q", scope.Name())
+	}
+	if rsc == nil {
+		return false, nil
+	}
+
+	vmID := int64(rsc.VMID)
+	scope.Info("adopting the vm that carries this machine's name instead of cloning another", "vmID", vmID, "node", rsc.Node)
+
+	// The VM exists, so a reservation this process holds for its ID is no longer needed.
+	releaseVMID(vmID)
+	scope.SetVirtualMachineID(vmID)
+	scope.SetAnnotation(vmIDAllocatedByControllerAnnotation, "true")
+	scope.ProxmoxMachine.Status.ProxmoxNode = new(rsc.Node)
+	scope.InfraCluster.ProxmoxCluster.UpdateNodeLocation(scope.Name(), rsc.Node, util.IsControlPlaneMachine(scope.Machine))
+	conditions.Set(scope.ProxmoxMachine, metav1.Condition{
+		Type:   infrav1.ProxmoxMachineVirtualMachineProvisionedCondition,
+		Status: metav1.ConditionFalse,
+		Reason: infrav1.ProxmoxMachineVirtualMachineProvisionedCloningReason,
+	})
+
+	return true, scope.InfraCluster.PatchObject()
 }
 
 // hasActiveTask checks whether a task is still running for the VM before it is started.

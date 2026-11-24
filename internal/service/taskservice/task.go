@@ -131,6 +131,14 @@ func checkAndRetryTask(scope *scope.MachineScope, task *proxmox.Task) (bool, err
 		// For all other jobs we do set the condition to failed.
 		switch {
 		case task.Type == "qmstart":
+			// The reason is kept so the state machine goes on from where it was. Without a
+			// condition there is nothing to keep; the API server rejects an empty reason,
+			// and a rejected status patch drops everything else written in the same pass,
+			// such as the VMID of a fresh clone (upstream #733). Fall back to the state
+			// that issues qmstart, which re-checks the power state.
+			if conditionReason == "" {
+				conditionReason = infrav1.ProxmoxMachineVirtualMachineProvisionedWaitingForVMPowerUpReason
+			}
 		case task.Type == "resize" && strings.Contains(task.ExitStatus, "does not exist"):
 			// The disk is there (the clone made it) but the node running the resize
 			// cannot see it yet: on shared storage a directory cache can lag a VM

@@ -150,6 +150,49 @@ func TestEnsureVirtualMachine_CreateVM_FullOptions(t *testing.T) {
 	requireConditionIsFalse(t, machineScope.ProxmoxMachine, infrav1.ProxmoxMachineVirtualMachineProvisionedCondition)
 }
 
+// The clone succeeded but the status patch recording its ID was rejected (upstream #733: an
+// empty condition reason failed the whole patch). The next pass must adopt the VM by name, not
+// clone a second one.
+func TestEnsureVirtualMachine_AdoptsExistingVMByName(t *testing.T) {
+	machineScope, proxmoxClient, _ := setupReconcilerTestWithCondition(t, infrav1.ProxmoxMachineVirtualMachineProvisionedCloningReason)
+	// Replace the setup's "no VM by that name" default; see TestGetVMID_NextIDError.
+	proxmoxClient.ExpectedCalls = nil
+	proxmoxClient.EXPECT().FindVMByName(context.Background(), "test").
+		Return(&lutherproxmox.ClusterResource{VMID: 105, Node: "node2", Type: "qemu", Name: "test"}, nil).Once()
+	// no CloneVM expectation: a second clone fails the test
+
+	requeue, err := ensureVirtualMachine(context.Background(), machineScope)
+	require.NoError(t, err)
+	require.True(t, requeue)
+	require.Equal(t, int64(105), machineScope.GetVirtualMachineID())
+	require.Equal(t, "node2", *machineScope.ProxmoxMachine.Status.ProxmoxNode)
+	require.Equal(t, "node2", machineScope.InfraCluster.ProxmoxCluster.GetNode(machineScope.Name(), false))
+	require.Equal(t, "true", machineScope.ProxmoxMachine.Annotations[vmIDAllocatedByControllerAnnotation])
+	require.Equal(t, infrav1.ProxmoxMachineVirtualMachineProvisionedCloningReason,
+		conditions.GetReason(machineScope.ProxmoxMachine, infrav1.ProxmoxMachineVirtualMachineProvisionedCondition))
+
+	// The following pass finds the VM under its ID on the recorded node and carries on.
+	vm := newRunningVM()
+	vm.VMID = 105
+	proxmoxClient.EXPECT().GetVM(context.Background(), "node2", int64(105)).Return(vm, nil).Once()
+	requeue, err = ensureVirtualMachine(context.Background(), machineScope)
+	require.NoError(t, err)
+	require.False(t, requeue)
+	require.Equal(t, vm, machineScope.VirtualMachine)
+}
+
+// When the name lookup cannot be answered, no clone is issued: another VM could be behind it.
+func TestEnsureVirtualMachine_NameLookupErrorBlocksClone(t *testing.T) {
+	machineScope, proxmoxClient, _ := setupReconcilerTestWithCondition(t, infrav1.ProxmoxMachineVirtualMachineProvisionedCloningReason)
+	proxmoxClient.ExpectedCalls = nil
+	proxmoxClient.EXPECT().FindVMByName(context.Background(), "test").
+		Return(nil, fmt.Errorf("%w: 2 VMs are named \"test\"", goproxmox.ErrVMNameNotUnique)).Once()
+
+	_, err := ensureVirtualMachine(context.Background(), machineScope)
+	require.ErrorIs(t, err, goproxmox.ErrVMNameNotUnique)
+	require.Equal(t, int64(-1), machineScope.GetVirtualMachineID())
+}
+
 func TestEnsureVirtualMachine_CreateVM_CloneAlreadyStarted(t *testing.T) {
 	machineScope, _, kubeClient := setupReconcilerTestWithCondition(t, infrav1.ProxmoxMachineVirtualMachineProvisionedCloningReason)
 
