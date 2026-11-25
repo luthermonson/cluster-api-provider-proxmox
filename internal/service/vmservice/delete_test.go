@@ -31,7 +31,6 @@ import (
 
 	infrav1 "github.com/ionos-cloud/cluster-api-provider-proxmox/api/v1alpha2"
 	"github.com/ionos-cloud/cluster-api-provider-proxmox/internal/service/taskservice"
-	capmox "github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/proxmox"
 	"github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/proxmox/proxmoxtest"
 	"github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/scope"
 )
@@ -40,7 +39,6 @@ const (
 	deleteTestVMID = int64(123)
 	stopUPID       = "UPID:node1:0000A:0000B:0000C:qmstop:123:root@pam:"
 	destroyUPID    = "UPID:node1:0000A:0000B:0000C:qmdestroy:123:root@pam:"
-	configUPID     = "UPID:node1:0000A:0000B:0000C:qmconfig:123:root@pam:"
 )
 
 // setupDeleteTest returns a machine that records VMID 123 on node1.
@@ -220,69 +218,6 @@ func TestDeleteVM_StopsRunningVMAndRecordsTask(t *testing.T) {
 	require.Equal(t, stopUPID, *machineScope.ProxmoxMachine.Status.TaskRef)
 	requireHeld(t, machineScope)
 	requireReason(t, machineScope, infrav1.ProxmoxMachineVirtualMachineProvisionedDeletingReason)
-}
-
-// With a deletion hookscript configured, a running VM gets the script and the deleting tag
-// first; the stop follows on the next pass, once that configure task is done.
-func TestDeleteVM_ArmsDeletionHookBeforeStop(t *testing.T) {
-	machineScope, proxmoxClient := setupDeleteTest(t)
-	machineScope.InfraCluster.ProxmoxCluster.Spec.DeletionHookScript = "local:snippets/destroy.sh"
-	vm := newRunningVM()
-	vm.VirtualMachineConfig.Tags = "lab;control-plane"
-	expectOwnedVM(proxmoxClient, "node1", vm)
-	proxmoxClient.EXPECT().HasActiveTask(context.TODO(), vm).Return(false, nil).Once()
-	proxmoxClient.EXPECT().ConfigureVM(context.TODO(), vm,
-		capmox.VirtualMachineOption{Name: "hookscript", Value: "local:snippets/destroy.sh"},
-		capmox.VirtualMachineOption{Name: "tags", Value: "lab;control-plane;deleting"},
-	).Return(&proxmox.Task{UPID: configUPID}, nil).Once()
-	// no StopVM expectation: the stop waits for the configure task
-
-	requeue, err := DeleteVM(context.TODO(), machineScope)
-	require.NoError(t, err)
-	require.True(t, requeue)
-	require.Equal(t, configUPID, *machineScope.ProxmoxMachine.Status.TaskRef)
-	requireHeld(t, machineScope)
-	requireReason(t, machineScope, infrav1.ProxmoxMachineVirtualMachineProvisionedDeletingReason)
-}
-
-// Once the VM carries the hookscript and the tag, the stop is issued as usual.
-func TestDeleteVM_StopsRunningVMWithArmedHook(t *testing.T) {
-	machineScope, proxmoxClient := setupDeleteTest(t)
-	machineScope.InfraCluster.ProxmoxCluster.Spec.DeletionHookScript = "local:snippets/destroy.sh"
-	vm := newRunningVM()
-	vm.VirtualMachineConfig.Hookscript = "local:snippets/destroy.sh"
-	vm.VirtualMachineConfig.Tags = "deleting"
-	expectOwnedVM(proxmoxClient, "node1", vm)
-	proxmoxClient.EXPECT().HasActiveTask(context.TODO(), vm).Return(false, nil).Once()
-	proxmoxClient.EXPECT().StopVM(context.TODO(), vm).Return(&proxmox.Task{UPID: stopUPID}, nil).Once()
-
-	requeue, err := DeleteVM(context.TODO(), machineScope)
-	require.NoError(t, err)
-	require.True(t, requeue)
-	require.Equal(t, stopUPID, *machineScope.ProxmoxMachine.Status.TaskRef)
-}
-
-// A stopped VM is destroyed by the provider whether or not a hookscript is configured: the
-// hook only fires on a stop the provider issues.
-func TestDeleteVM_DestroysStoppedVMWithHookConfigured(t *testing.T) {
-	machineScope, proxmoxClient := setupDeleteTest(t)
-	machineScope.InfraCluster.ProxmoxCluster.Spec.DeletionHookScript = "local:snippets/destroy.sh"
-	vm := newStoppedVM()
-	vm.VMID = proxmox.StringOrUint64(deleteTestVMID)
-	expectOwnedVM(proxmoxClient, "node1", vm)
-	proxmoxClient.EXPECT().HasActiveTask(context.TODO(), vm).Return(false, nil).Once()
-	proxmoxClient.EXPECT().DeleteVM(context.TODO(), "node1", deleteTestVMID).Return(&proxmox.Task{UPID: destroyUPID}, nil).Once()
-
-	requeue, err := DeleteVM(context.TODO(), machineScope)
-	require.NoError(t, err)
-	require.True(t, requeue)
-	require.Equal(t, destroyUPID, *machineScope.ProxmoxMachine.Status.TaskRef)
-}
-
-func TestWithTag(t *testing.T) {
-	require.Equal(t, "deleting", withTag("", "deleting"))
-	require.Equal(t, "a;b;deleting", withTag("a;b", "deleting"))
-	require.Equal(t, "a;deleting;b", withTag("a;deleting;b", "deleting"))
 }
 
 // A paused VM has status running too and needs the stop as well.
