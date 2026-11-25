@@ -19,9 +19,12 @@ package vmservice
 
 import (
 	"context"
+	"fmt"
+	"regexp"
 	"slices"
 	"strings"
 
+	lutherproxmox "github.com/luthermonson/go-proxmox"
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -48,10 +51,18 @@ const (
 	optionMemory      = "memory"
 	optionTags        = "tags"
 	optionDescription = "description"
+	// optionDelete names config keys to remove, comma separated.
+	optionDelete = "delete"
+
+	// lockClone is the config lock a VM carries while its clone task runs.
+	lockClone = "clone"
 )
 
 // ErrNoVMIDInRangeFree is returned if no free VMID is found in the specified vmIDRange.
 var ErrNoVMIDInRangeFree = errors.New("No free vmid found in vmIDRange")
+
+// ErrNoVMIDFree is returned if no free VMID is found above the cluster's next free one.
+var ErrNoVMIDFree = errors.New("No free vmid found in the cluster")
 
 // ReconcileVM makes sure that the VM is in the desired state by:
 //  1. Creating the VM if it does not exist, then...
@@ -142,6 +153,15 @@ func ReconcileVM(ctx context.Context, scope *scope.MachineScope) (infrav1.Virtua
 	} // State Machine is finished
 	scope.Logger.V(4).Info("condition", "condition", conditions.GetReason(scope.ProxmoxMachine, infrav1.ProxmoxMachineVirtualMachineProvisionedCondition))
 
+	// A machine that was never provisioned gets here only when every step above ran, and the
+	// last of them starts the VM. A stopped VM means the steps were skipped because the
+	// condition carried a reason none of them handles, so do not report it ready: that would
+	// hand Cluster API a node that never boots.
+	if !ptr.Deref(scope.ProxmoxMachine.Status.Initialization.Provisioned, false) && !scope.VirtualMachine.IsRunning() {
+		reason := conditions.GetReason(scope.ProxmoxMachine, infrav1.ProxmoxMachineVirtualMachineProvisionedCondition)
+		return vm, errors.Errorf("vm %s is not running although provisioning finished (condition reason %q); not reporting it ready", scope.Name(), reason)
+	}
+
 	vm.State = infrav1.VirtualMachineStateReady
 	return vm, nil
 }
@@ -160,32 +180,47 @@ func checkCloudInitStatus(ctx context.Context, machineScope *scope.MachineScope)
 
 	if !machineScope.SkipQemuGuestCheck() {
 		if err := machineScope.InfraCluster.ProxmoxClient.QemuAgentStatus(ctx, machineScope.VirtualMachine); err != nil {
-			return true, errors.Wrap(err, "error waiting for agent")
+			// The guest is booting and its agent is not answering yet, which is expected
+			// for a while after power-on. A timed requeue keeps the controller polling at a
+			// steady pace; a plain error would be logged as a reconciler error and backed
+			// off exponentially.
+			machineScope.V(4).Info("qemu guest agent not reachable yet, waiting", "vm", machineScope.VirtualMachine.VMID, "cause", err.Error())
+			return true, taskservice.NewRequeueError("waiting for the qemu guest agent: "+err.Error(), infrav1.DefaultReconcilerRequeue)
 		}
 	}
 
 	// TODO: Is there a status for Ignition?
+	var message string
 	if !machineScope.SkipCloudInitCheck() {
-		if running, err := machineScope.InfraCluster.ProxmoxClient.CloudInitStatus(ctx, machineScope.VirtualMachine); err != nil || running {
-			if running {
-				return true, nil
-			}
-			if errors.Is(err, goproxmox.ErrCloudInitFailed) {
-				conditions.Set(machineScope.ProxmoxMachine, metav1.Condition{
-					Type:    infrav1.ProxmoxMachineVirtualMachineProvisionedCondition,
-					Status:  metav1.ConditionFalse,
-					Reason:  infrav1.ProxmoxMachineVirtualMachineProvisionedVMProvisionFailedReason,
-					Message: err.Error(),
-				})
-			}
+		running, err := machineScope.InfraCluster.ProxmoxClient.CloudInitStatus(ctx, machineScope.VirtualMachine)
+		if running {
+			return true, nil
+		}
+		switch {
+		case err == nil:
+		case errors.Is(err, goproxmox.ErrCloudInitRecoverable):
+			// cloud-init is done and the guest is usable; keep the warning where the user
+			// sees it instead of failing a machine that will join.
+			machineScope.Info("cloud-init finished with recoverable errors", "vm", machineScope.VirtualMachine.VMID, "detail", err.Error())
+			message = err.Error()
+		case errors.Is(err, goproxmox.ErrCloudInitFailed):
+			conditions.Set(machineScope.ProxmoxMachine, metav1.Condition{
+				Type:    infrav1.ProxmoxMachineVirtualMachineProvisionedCondition,
+				Status:  metav1.ConditionFalse,
+				Reason:  infrav1.ProxmoxMachineVirtualMachineProvisionedVMProvisionFailedReason,
+				Message: err.Error(),
+			})
+			return false, err
+		default:
 			return false, err
 		}
 	}
 
 	conditions.Set(machineScope.ProxmoxMachine, metav1.Condition{
-		Type:   infrav1.ProxmoxMachineVirtualMachineProvisionedCondition,
-		Status: metav1.ConditionFalse,
-		Reason: infrav1.ProxmoxMachineVirtualMachineProvisionedWaitingForBootstrapReadyReason,
+		Type:    infrav1.ProxmoxMachineVirtualMachineProvisionedCondition,
+		Status:  metav1.ConditionFalse,
+		Reason:  infrav1.ProxmoxMachineVirtualMachineProvisionedWaitingForBootstrapReadyReason,
+		Message: message,
 	})
 	return false, nil
 }
@@ -200,9 +235,14 @@ func ensureVirtualMachine(ctx context.Context, machineScope *scope.MachineScope)
 	// Initialize the state machine for proxmox machine deployment.
 	// NOTE: We are setting this condition only in case it does not exist, so we avoid to get flickering LastConditionTime
 	// in case of cloning errors or powering on errors.
+	// InsufficientMemory is included in the resettable reasons so a machine that
+	// ran out of schedulable memory resumes the normal Cloning flow once memory
+	// becomes available, instead of being stuck at a reason no reconcile step
+	// accepts.
 	if !conditions.Has(machineScope.ProxmoxMachine, infrav1.ProxmoxMachineVirtualMachineProvisionedCondition) ||
 		conditions.GetReason(machineScope.ProxmoxMachine, infrav1.ProxmoxMachineVirtualMachineProvisionedCondition) == clusterv1.WaitingForClusterInfrastructureReadyReason ||
-		conditions.GetReason(machineScope.ProxmoxMachine, infrav1.ProxmoxMachineVirtualMachineProvisionedCondition) == clusterv1.WaitingForBootstrapDataReason {
+		conditions.GetReason(machineScope.ProxmoxMachine, infrav1.ProxmoxMachineVirtualMachineProvisionedCondition) == clusterv1.WaitingForBootstrapDataReason ||
+		conditions.GetReason(machineScope.ProxmoxMachine, infrav1.ProxmoxMachineVirtualMachineProvisionedCondition) == infrav1.ProxmoxMachineVirtualMachineProvisionedInsufficientMemoryReason {
 		conditions.Set(machineScope.ProxmoxMachine, metav1.Condition{
 			Type:   infrav1.ProxmoxMachineVirtualMachineProvisionedCondition,
 			Status: metav1.ConditionFalse,
@@ -243,12 +283,23 @@ func ensureVirtualMachine(ctx context.Context, machineScope *scope.MachineScope)
 			return true, nil
 		}
 
+		// The clone of an earlier pass may have run while the status update recording its
+		// ID was rejected (a rejected patch loses spec.virtualMachineID and status.taskRef
+		// together). Cloning again would leave that VM behind, so a VM that already carries
+		// this machine's name is adopted instead: one list call per clone attempt.
+		adopted, err := adoptVMByName(ctx, machineScope)
+		if err != nil || adopted {
+			return adopted, err
+		}
+
 		// Create the VM.
 		resp, err := createVM(ctx, machineScope)
 		if err != nil {
-			// Only set CloningFailed if createVM didn't already set a terminal
-			// failure reason (e.g. VMProvisionFailed for insufficient resources).
-			if conditions.GetReason(machineScope.ProxmoxMachine, infrav1.ProxmoxMachineVirtualMachineProvisionedCondition) != infrav1.ProxmoxMachineVirtualMachineProvisionedVMProvisionFailedReason {
+			// Only set CloningFailed if createVM didn't already set a more
+			// specific reason: VMProvisionFailed for terminal failures, or
+			// InsufficientMemory for the transient scheduling shortage.
+			if reason := conditions.GetReason(machineScope.ProxmoxMachine, infrav1.ProxmoxMachineVirtualMachineProvisionedCondition); reason != infrav1.ProxmoxMachineVirtualMachineProvisionedVMProvisionFailedReason &&
+				reason != infrav1.ProxmoxMachineVirtualMachineProvisionedInsufficientMemoryReason {
 				conditions.Set(machineScope.ProxmoxMachine, metav1.Condition{
 					Type:    infrav1.ProxmoxMachineVirtualMachineProvisionedCondition,
 					Status:  metav1.ConditionFalse,
@@ -265,9 +316,23 @@ func ensureVirtualMachine(ctx context.Context, machineScope *scope.MachineScope)
 		machineScope.SetVirtualMachineID(resp.NewID)
 		machineScope.SetAnnotation(vmIDAllocatedByControllerAnnotation, "true")
 
+		// The clone is running, so the machine is Cloning whatever an earlier attempt left in
+		// the condition. A transient clone failure sets CloningFailed; without this reset the
+		// retried clone would succeed but every later step, each gated on its own reason, would
+		// skip, and the machine would be reported ready with a stopped, unconfigured VM.
+		conditions.Set(machineScope.ProxmoxMachine, metav1.Condition{
+			Type:   infrav1.ProxmoxMachineVirtualMachineProvisionedCondition,
+			Status: metav1.ConditionFalse,
+			Reason: infrav1.ProxmoxMachineVirtualMachineProvisionedCloningReason,
+		})
+
 		// requeue until cloning is finished
 		return true, nil
 	}
+
+	// The VM exists under its own name, so its VMID is taken in Proxmox and the reservation
+	// made for the clone is no longer needed.
+	releaseVMID(machineScope.GetVirtualMachineID())
 
 	// make sure spec.providerID is always set.
 	biosUUID := extractUUID(vmRef.VirtualMachineConfig.SMBios1)
@@ -278,6 +343,37 @@ func ensureVirtualMachine(ctx context.Context, machineScope *scope.MachineScope)
 
 	// at this point the VM is found, so err must be nil
 	return false, nil
+}
+
+// adoptVMByName looks for a VM named after the machine and, when there is one, records it as
+// the machine's VM the way a fresh clone is recorded: VMID, node, node location and the Cloning
+// reason, from which the state machine carries on. It reports whether a VM was adopted. The
+// next pass reads the VM under its ID and checks the name again (FindVM).
+func adoptVMByName(ctx context.Context, scope *scope.MachineScope) (bool, error) {
+	rsc, err := scope.InfraCluster.ProxmoxClient.FindVMByName(ctx, scope.Name())
+	if err != nil {
+		return false, errors.Wrapf(err, "unable to look for an existing vm named %q", scope.Name())
+	}
+	if rsc == nil {
+		return false, nil
+	}
+
+	vmID := int64(rsc.VMID)
+	scope.Info("adopting the vm that carries this machine's name instead of cloning another", "vmID", vmID, "node", rsc.Node)
+
+	// The VM exists, so a reservation this process holds for its ID is no longer needed.
+	releaseVMID(vmID)
+	scope.SetVirtualMachineID(vmID)
+	scope.SetAnnotation(vmIDAllocatedByControllerAnnotation, "true")
+	scope.ProxmoxMachine.Status.ProxmoxNode = new(rsc.Node)
+	scope.InfraCluster.ProxmoxCluster.UpdateNodeLocation(scope.Name(), rsc.Node, util.IsControlPlaneMachine(scope.Machine))
+	conditions.Set(scope.ProxmoxMachine, metav1.Condition{
+		Type:   infrav1.ProxmoxMachineVirtualMachineProvisionedCondition,
+		Status: metav1.ConditionFalse,
+		Reason: infrav1.ProxmoxMachineVirtualMachineProvisionedCloningReason,
+	})
+
+	return true, scope.InfraCluster.PatchObject()
 }
 
 // hasActiveTask checks whether a task is still running for the VM before it is started.
@@ -291,7 +387,7 @@ func hasActiveTask(ctx context.Context, machineScope *scope.MachineScope) (bool,
 		return false, nil
 	}
 
-	if vm.Lock == "clone" {
+	if vm.Lock == lockClone {
 		machineScope.V(4).Info("waiting for the clone of the vm to finish", "vm", vm.VMID)
 		return true, nil
 	}
@@ -392,6 +488,16 @@ func reconcileVirtualMachineConfig(ctx context.Context, machineScope *scope.Mach
 				Value: formatNetworkDevice(ptr.Deref(v.Model, "virtio"), ptr.Deref(v.Bridge, ""), v.MTU, v.VLAN, v.Queues),
 			})
 		}
+	}
+
+	// A template built with a Proxmox cloud-init drive ("ide2: <storage>:vm-<id>-cloudinit")
+	// hands a copy of that drive to every clone. The provider attaches its own cloud-init ISO
+	// on another device, so the guest sees two NoCloud datasources and may take the template's:
+	// no address, no bootstrap data, a machine that never joins. Detach the inherited drive
+	// before the VM is first started; Proxmox frees the volume with it.
+	if drives := cloudInitDrives(vmConfig); len(drives) > 0 {
+		machineScope.V(4).Info("removing cloud-init drives inherited from the template", "drives", drives)
+		vmOptions = append(vmOptions, proxmox.VirtualMachineOption{Name: optionDelete, Value: strings.Join(drives, ",")})
 	}
 
 	// custom tags
@@ -498,7 +604,7 @@ func getClusterAPIMachineAddresses(scope *scope.MachineScope) ([]clusterv1.Machi
 func createVM(ctx context.Context, scope *scope.MachineScope) (proxmox.VMCloneResponse, error) {
 	vmid, err := getVMID(ctx, scope)
 	if err != nil {
-		if errors.Is(err, ErrNoVMIDInRangeFree) {
+		if errors.Is(err, ErrNoVMIDInRangeFree) || errors.Is(err, ErrNoVMIDFree) {
 			conditions.Set(scope.ProxmoxMachine, metav1.Condition{
 				Type:    infrav1.ProxmoxMachineVirtualMachineProvisionedCondition,
 				Status:  metav1.ConditionFalse,
@@ -541,13 +647,20 @@ func createVM(ctx context.Context, scope *scope.MachineScope) (proxmox.VMCloneRe
 		options.Target, err = selectNextNode(ctx, scope)
 		if err != nil {
 			if errors.As(err, &scheduler.InsufficientMemoryError{}) {
+				// Insufficient memory is transient: the situation usually changes
+				// as machines are created or deleted elsewhere, so the machine
+				// must keep retrying. VMProvisionFailed is terminal - the
+				// controller stops reconciling a machine carrying it - and
+				// latching a scheduling shortage into it permanently stalls
+				// rollouts (#864).
 				conditions.Set(scope.ProxmoxMachine, metav1.Condition{
 					Type:    infrav1.ProxmoxMachineVirtualMachineProvisionedCondition,
 					Status:  metav1.ConditionFalse,
-					Reason:  infrav1.ProxmoxMachineVirtualMachineProvisionedVMProvisionFailedReason,
+					Reason:  infrav1.ProxmoxMachineVirtualMachineProvisionedInsufficientMemoryReason,
 					Message: err.Error(),
 				})
 			}
+			releaseVMID(vmid)
 			return proxmox.VMCloneResponse{}, err
 		}
 	}
@@ -568,11 +681,16 @@ func createVM(ctx context.Context, scope *scope.MachineScope) (proxmox.VMCloneRe
 					Message: err.Error(),
 				})
 			}
+			releaseVMID(vmid)
 			return proxmox.VMCloneResponse{}, err
 		}
 	}
 	res, err := scope.InfraCluster.ProxmoxClient.CloneVM(ctx, int(templateID), options)
 	if err != nil {
+		// No clone was issued (as on the two returns above), so the ID is free for the next
+		// machine. Leaving it reserved would burn an ID per failed attempt while, say, a node
+		// stays unreachable for a minute.
+		releaseVMID(vmid)
 		return res, err
 	}
 
@@ -593,38 +711,6 @@ func createVM(ctx context.Context, scope *scope.MachineScope) (proxmox.VMCloneRe
 	return res, scope.InfraCluster.PatchObject()
 }
 
-func getVMID(ctx context.Context, scope *scope.MachineScope) (int64, error) {
-	if scope.ProxmoxMachine.Spec.VMIDRange != nil {
-		vmIDRangeStart := scope.ProxmoxMachine.Spec.VMIDRange.Start
-		vmIDRangeEnd := scope.ProxmoxMachine.Spec.VMIDRange.End
-		if vmIDRangeStart != 0 && vmIDRangeEnd != 0 {
-			return getNextFreeVMIDfromRange(ctx, scope, vmIDRangeStart, vmIDRangeEnd)
-		}
-	}
-	// If VMIDRange is not defined, return 0 to let luthermonson/go-proxmox get the next free id.
-	return 0, nil
-}
-
-func getNextFreeVMIDfromRange(ctx context.Context, scope *scope.MachineScope, vmIDRangeStart int64, vmIDRangeEnd int64) (int64, error) {
-	usedVMIDs, err := getUsedVMIDs(ctx, scope)
-	if err != nil {
-		return 0, err
-	}
-	// Get next free vmid from the range
-	for i := vmIDRangeStart; i <= vmIDRangeEnd; i++ {
-		if slices.Contains(usedVMIDs, i) {
-			continue
-		}
-		if vmidFree, err := scope.InfraCluster.ProxmoxClient.CheckID(ctx, i); err == nil && vmidFree {
-			return i, nil
-		} else if err != nil {
-			return 0, err
-		}
-	}
-	// Fail if we can't find a free vmid in the range.
-	return 0, ErrNoVMIDInRangeFree
-}
-
 func getUsedVMIDs(ctx context.Context, scope *scope.MachineScope) ([]int64, error) {
 	// Get all used vmids from existing ProxmoxMachines
 	usedVMIDs := []int64{}
@@ -643,5 +729,40 @@ func getUsedVMIDs(ctx context.Context, scope *scope.MachineScope) ([]int64, erro
 var selectNextNode = scheduler.ScheduleVM
 
 func unmountCloudInitISO(ctx context.Context, machineScope *scope.MachineScope) error {
-	return machineScope.InfraCluster.ProxmoxClient.UnmountCloudInitISO(ctx, machineScope.VirtualMachine, inject.CloudInitISODevice)
+	vm := machineScope.VirtualMachine
+	return machineScope.InfraCluster.ProxmoxClient.UnmountCloudInitISO(ctx, vm, cloudInitISODevice(vm))
+}
+
+// cloudInitISODevice returns the drive of the VM that carries its cloud-init ISO,
+// "user-data-<vmid>.iso", wherever the injector attached it (ide0 on x86, a scsiN slot on
+// aarch64). Several matches are resolved to the lowest device name. When no drive carries
+// the ISO the device the injector would pick for this VM is returned, so an unmount still
+// targets the slot the ISO would have been on.
+func cloudInitISODevice(vm *lutherproxmox.VirtualMachine) string {
+	if vm == nil {
+		return inject.CloudInitISODevice
+	}
+	if drives := drivesWithVolume(vm.VirtualMachineConfig, fmt.Sprintf(lutherproxmox.UserDataISOFormat, vm.VMID)); len(drives) > 0 {
+		return drives[0]
+	}
+	return inject.CloudInitISODeviceFor(vm.VirtualMachineConfig)
+}
+
+// drivesWithVolume lists the drives of cfg whose value names the given volume file
+// ("local:iso/user-data-123.iso,media=cdrom" for "user-data-123.iso"), sorted by device.
+func drivesWithVolume(cfg *lutherproxmox.VirtualMachineConfig, file string) []string {
+	if cfg == nil {
+		return nil
+	}
+	pattern := regexp.MustCompile(`(^|[:/])` + regexp.QuoteMeta(file) + `(,|$)`)
+	var out []string
+	for _, m := range []map[string]string{cfg.IDEs, cfg.SCSIs, cfg.SATAs, cfg.VirtIOs} {
+		for dev, value := range m {
+			if pattern.MatchString(value) {
+				out = append(out, dev)
+			}
+		}
+	}
+	slices.Sort(out)
+	return out
 }

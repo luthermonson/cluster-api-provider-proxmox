@@ -98,6 +98,35 @@ func (r *ProxmoxMachineReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// Fetch the Machine.
 	machine, err := util.GetOwnerMachine(ctx, r.Client, proxmoxMachine.ObjectMeta)
 	if err != nil {
+		// The owner Machine OwnerRef is set but the Machine object itself is
+		// gone. This is the stuck-finalizer deadlock: without this branch the
+		// reconciler returns the NotFound error to controller-runtime, which
+		// requeues with exponential backoff forever, never reaching
+		// reconcileDelete and never removing our finalizer. The ProxmoxMachine
+		// then blocks the parent ProxmoxCluster (waiting for machines) and the
+		// Cluster from finalizing.
+		//
+		// We can hit this whenever the owner Machine is removed before the
+		// InfraMachine is finalized: a manual finalizer strip, the
+		// `cluster.x-k8s.io/force-delete-machine` annotation, or any other
+		// actor that out-of-band reaps the Machine.
+		if apierrors.IsNotFound(err) {
+			if !proxmoxMachine.ObjectMeta.DeletionTimestamp.IsZero() {
+				logger.Info("Owner Machine not found while ProxmoxMachine is being deleted; removing finalizer to unblock cluster delete. The underlying Proxmox VM may still exist and should be verified by an administrator.")
+				if ctrlutil.RemoveFinalizer(proxmoxMachine, infrav1.MachineFinalizer) {
+					if err := r.Client.Update(ctx, proxmoxMachine); err != nil {
+						return ctrl.Result{}, errors.Wrap(err, "removing finalizer after owner Machine not found")
+					}
+				}
+				return ctrl.Result{}, nil
+			}
+			// ProxmoxMachine is not being deleted. The OwnerRef points to a
+			// missing Machine — log and skip rather than error-loop. Either
+			// the OwnerRef will be corrected, or the ProxmoxMachine will be
+			// deleted, both of which trigger another reconcile.
+			logger.Info("Owner Machine not found and ProxmoxMachine is not being deleted; skipping reconcile.")
+			return ctrl.Result{}, nil
+		}
 		return ctrl.Result{}, err
 	}
 	if machine == nil {
@@ -162,18 +191,24 @@ func (r *ProxmoxMachineReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 func (r *ProxmoxMachineReconciler) reconcileDelete(ctx context.Context, machineScope *scope.MachineScope) (ctrl.Result, error) {
 	machineScope.Logger.Info("Handling deleted ProxmoxMachine")
-	conditions.Set(machineScope.ProxmoxMachine, metav1.Condition{
-		Type:   infrav1.ProxmoxMachineVirtualMachineProvisionedCondition,
-		Status: metav1.ConditionFalse,
-		Reason: clusterv1.DeletingReason,
-	})
 
-	err := vmservice.DeleteVM(ctx, machineScope)
+	// Deletion runs one Proxmox task per pass (stop, destroy, confirm) and records each in
+	// status.taskRef, so the requeue below is what drives it; a RequeueError carries the
+	// wait after a failed task.
+	requeue, err := vmservice.DeleteVM(ctx, machineScope)
 	if err != nil {
+		if requeueErr := new(taskservice.RequeueError); errors.As(err, &requeueErr) {
+			machineScope.V(4).Info("requeue requested", "after", requeueErr.RequeueAfter(), "reason", err.Error())
+			return reconcile.Result{RequeueAfter: requeueErr.RequeueAfter()}, nil
+		}
 		return reconcile.Result{}, err
 	}
-	// VM is being deleted
-	return reconcile.Result{RequeueAfter: infrav1.DefaultReconcilerRequeue}, nil
+	if requeue {
+		// VM is being deleted
+		return reconcile.Result{RequeueAfter: infrav1.DefaultReconcilerRequeue}, nil
+	}
+	// The VM is gone and the finalizer is off; the patch in Close lets the object go.
+	return reconcile.Result{}, nil
 }
 
 func (r *ProxmoxMachineReconciler) reconcileNormal(ctx context.Context, machineScope *scope.MachineScope, clusterScope *scope.ClusterScope) (reconcile.Result, error) {
@@ -220,7 +255,9 @@ func (r *ProxmoxMachineReconciler) reconcileNormal(ctx context.Context, machineS
 	vm, err := vmservice.ReconcileVM(ctx, machineScope)
 	if err != nil {
 		if requeueErr := new(taskservice.RequeueError); errors.As(err, &requeueErr) {
-			machineScope.Error(err, "Requeue requested")
+			// A requeue is the state machine pacing itself (a failed task's wait, a guest
+			// agent that is not up yet), not a failure to report at error level.
+			machineScope.V(4).Info("requeue requested", "after", requeueErr.RequeueAfter(), "reason", err.Error())
 			return reconcile.Result{RequeueAfter: requeueErr.RequeueAfter()}, nil
 		}
 		machineScope.Logger.Error(err, "error reconciling VM")

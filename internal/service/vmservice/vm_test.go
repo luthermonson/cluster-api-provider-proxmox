@@ -32,6 +32,7 @@ import (
 
 	infrav1 "github.com/ionos-cloud/cluster-api-provider-proxmox/api/v1alpha2"
 	"github.com/ionos-cloud/cluster-api-provider-proxmox/internal/service/scheduler"
+	"github.com/ionos-cloud/cluster-api-provider-proxmox/internal/service/taskservice"
 	"github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/proxmox"
 	"github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/proxmox/goproxmox"
 	"github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/scope"
@@ -125,6 +126,7 @@ func TestEnsureVirtualMachine_CreateVM_FullOptions(t *testing.T) {
 	machineScope.ProxmoxMachine.Spec.AllowedNodes = []string{"node2"}
 	expectedOptions := proxmox.VMCloneRequest{
 		Node:        "node1",
+		NewID:       100,
 		Name:        "test",
 		Description: "test vm",
 		Format:      "raw",
@@ -146,6 +148,49 @@ func TestEnsureVirtualMachine_CreateVM_FullOptions(t *testing.T) {
 	require.True(t, machineScope.InfraCluster.ProxmoxCluster.HasMachine(machineScope.Name(), false))
 	require.Equal(t, "true", machineScope.ProxmoxMachine.Annotations[vmIDAllocatedByControllerAnnotation])
 	requireConditionIsFalse(t, machineScope.ProxmoxMachine, infrav1.ProxmoxMachineVirtualMachineProvisionedCondition)
+}
+
+// The clone succeeded but the status patch recording its ID was rejected (upstream #733: an
+// empty condition reason failed the whole patch). The next pass must adopt the VM by name, not
+// clone a second one.
+func TestEnsureVirtualMachine_AdoptsExistingVMByName(t *testing.T) {
+	machineScope, proxmoxClient, _ := setupReconcilerTestWithCondition(t, infrav1.ProxmoxMachineVirtualMachineProvisionedCloningReason)
+	// Replace the setup's "no VM by that name" default; see TestGetVMID_NextIDError.
+	proxmoxClient.ExpectedCalls = nil
+	proxmoxClient.EXPECT().FindVMByName(context.Background(), "test").
+		Return(&lutherproxmox.ClusterResource{VMID: 105, Node: "node2", Type: "qemu", Name: "test"}, nil).Once()
+	// no CloneVM expectation: a second clone fails the test
+
+	requeue, err := ensureVirtualMachine(context.Background(), machineScope)
+	require.NoError(t, err)
+	require.True(t, requeue)
+	require.Equal(t, int64(105), machineScope.GetVirtualMachineID())
+	require.Equal(t, "node2", *machineScope.ProxmoxMachine.Status.ProxmoxNode)
+	require.Equal(t, "node2", machineScope.InfraCluster.ProxmoxCluster.GetNode(machineScope.Name(), false))
+	require.Equal(t, "true", machineScope.ProxmoxMachine.Annotations[vmIDAllocatedByControllerAnnotation])
+	require.Equal(t, infrav1.ProxmoxMachineVirtualMachineProvisionedCloningReason,
+		conditions.GetReason(machineScope.ProxmoxMachine, infrav1.ProxmoxMachineVirtualMachineProvisionedCondition))
+
+	// The following pass finds the VM under its ID on the recorded node and carries on.
+	vm := newRunningVM()
+	vm.VMID = 105
+	proxmoxClient.EXPECT().GetVM(context.Background(), "node2", int64(105)).Return(vm, nil).Once()
+	requeue, err = ensureVirtualMachine(context.Background(), machineScope)
+	require.NoError(t, err)
+	require.False(t, requeue)
+	require.Equal(t, vm, machineScope.VirtualMachine)
+}
+
+// When the name lookup cannot be answered, no clone is issued: another VM could be behind it.
+func TestEnsureVirtualMachine_NameLookupErrorBlocksClone(t *testing.T) {
+	machineScope, proxmoxClient, _ := setupReconcilerTestWithCondition(t, infrav1.ProxmoxMachineVirtualMachineProvisionedCloningReason)
+	proxmoxClient.ExpectedCalls = nil
+	proxmoxClient.EXPECT().FindVMByName(context.Background(), "test").
+		Return(nil, fmt.Errorf("%w: 2 VMs are named \"test\"", goproxmox.ErrVMNameNotUnique)).Once()
+
+	_, err := ensureVirtualMachine(context.Background(), machineScope)
+	require.ErrorIs(t, err, goproxmox.ErrVMNameNotUnique)
+	require.Equal(t, int64(-1), machineScope.GetVirtualMachineID())
 }
 
 func TestEnsureVirtualMachine_CreateVM_CloneAlreadyStarted(t *testing.T) {
@@ -186,6 +231,7 @@ func TestEnsureVirtualMachine_CreateVM_FullOptions_TemplateSelector(t *testing.T
 	machineScope.ProxmoxMachine.Spec.AllowedNodes = []string{"node1", "node2"}
 	expectedOptions := proxmox.VMCloneRequest{
 		Node:        "node1",
+		NewID:       100,
 		Name:        "test",
 		Description: "test vm",
 		Format:      "raw",
@@ -259,7 +305,7 @@ func TestEnsureVirtualMachine_CreateVM_SelectNode(t *testing.T) {
 	}
 	t.Cleanup(func() { selectNextNode = scheduler.ScheduleVM })
 
-	expectedOptions := proxmox.VMCloneRequest{Node: "node1", Name: "test", Target: "node3", Full: true}
+	expectedOptions := proxmox.VMCloneRequest{Node: "node1", NewID: 100, Name: "test", Target: "node3", Full: true}
 	response := proxmox.VMCloneResponse{NewID: 123, Task: newTask()}
 	proxmoxClient.EXPECT().CloneVM(context.Background(), 123, expectedOptions).Return(response, nil).Once()
 
@@ -282,7 +328,7 @@ func TestEnsureVirtualMachine_CreateVM_SelectNode_MachineAllowedNodes(t *testing
 	}
 	t.Cleanup(func() { selectNextNode = scheduler.ScheduleVM })
 
-	expectedOptions := proxmox.VMCloneRequest{Node: "node1", Name: "test", Target: "node2", Full: true}
+	expectedOptions := proxmox.VMCloneRequest{Node: "node1", NewID: 100, Name: "test", Target: "node2", Full: true}
 	response := proxmox.VMCloneResponse{NewID: 123, Task: newTask()}
 	proxmoxClient.EXPECT().CloneVM(context.Background(), 123, expectedOptions).Return(response, nil).Once()
 
@@ -309,7 +355,49 @@ func TestEnsureVirtualMachine_CreateVM_SelectNode_InsufficientMemory(t *testing.
 
 	require.False(t, machineScope.InfraCluster.ProxmoxCluster.HasMachine(machineScope.Name(), false))
 	requireConditionIsFalse(t, machineScope.ProxmoxMachine, infrav1.ProxmoxMachineVirtualMachineProvisionedCondition)
-	require.True(t, machineScope.HasFailed())
+
+	// Insufficient memory is transient: the machine must not be latched as
+	// terminally failed (the controller skips reconciliation of a failed
+	// machine forever, #864), and the reason must be the retryable one.
+	require.False(t, machineScope.HasFailed())
+	require.Equal(t, infrav1.ProxmoxMachineVirtualMachineProvisionedInsufficientMemoryReason,
+		conditions.GetReason(machineScope.ProxmoxMachine, infrav1.ProxmoxMachineVirtualMachineProvisionedCondition))
+}
+
+func TestEnsureVirtualMachine_CreateVM_InsufficientMemoryRecovers(t *testing.T) {
+	// Regression test for #864: a machine that ran out of schedulable memory
+	// must resume the normal cloning flow once memory becomes available, not
+	// stay stuck on a reason no reconcile step accepts.
+	machineScope, proxmoxClient, _ := setupReconcilerTestWithCondition(t, infrav1.ProxmoxMachineVirtualMachineProvisionedCloningReason)
+	machineScope.InfraCluster.ProxmoxCluster.Spec.AllowedNodes = []string{"node1"}
+
+	selectNextNode = func(context.Context, *scope.MachineScope) (string, error) {
+		return "", fmt.Errorf("error: %w", scheduler.InsufficientMemoryError{})
+	}
+
+	// First attempt: not enough memory.
+	_, err := ensureVirtualMachine(context.Background(), machineScope)
+	require.Error(t, err)
+	require.Equal(t, infrav1.ProxmoxMachineVirtualMachineProvisionedInsufficientMemoryReason,
+		conditions.GetReason(machineScope.ProxmoxMachine, infrav1.ProxmoxMachineVirtualMachineProvisionedCondition))
+
+	// Second attempt: memory was freed elsewhere, scheduling succeeds and the
+	// machine re-enters the Cloning flow.
+	selectNextNode = func(context.Context, *scope.MachineScope) (string, error) {
+		return "node1", nil
+	}
+	t.Cleanup(func() { selectNextNode = scheduler.ScheduleVM })
+
+	expectedOptions := proxmox.VMCloneRequest{Node: "node1", Target: "node1", NewID: 100, Name: "test", Full: true}
+	response := proxmox.VMCloneResponse{Task: newTask(), NewID: int64(105)}
+	proxmoxClient.EXPECT().CloneVM(context.Background(), 123, expectedOptions).Return(response, nil).Once()
+
+	requeue, err := ensureVirtualMachine(context.Background(), machineScope)
+	require.NoError(t, err)
+	require.True(t, requeue)
+	require.Equal(t, infrav1.ProxmoxMachineVirtualMachineProvisionedCloningReason,
+		conditions.GetReason(machineScope.ProxmoxMachine, infrav1.ProxmoxMachineVirtualMachineProvisionedCondition))
+	require.True(t, machineScope.InfraCluster.ProxmoxCluster.HasMachine(machineScope.Name(), false))
 }
 
 func TestEnsureVirtualMachine_CreateVM_VMIDRange(t *testing.T) {
@@ -876,6 +964,51 @@ func TestReconcileVM_CloudInitFailed(t *testing.T) {
 	require.Equal(t, metav1.ConditionFalse, cond.Status)
 }
 
+// A guest agent that does not answer yet is the normal state of a booting VM: the pass asks for
+// a timed requeue (no reconciler error, no exponential backoff) and leaves the condition alone.
+func TestCheckCloudInitStatus_AgentNotReadyRequeues(t *testing.T) {
+	machineScope, proxmoxClient, _ := setupReconcilerTestWithCondition(t, infrav1.ProxmoxMachineVirtualMachineProvisionedWaitingForCloudInitReason)
+	vm := newRunningVM()
+	machineScope.SetVirtualMachine(vm)
+
+	proxmoxClient.EXPECT().QemuAgentStatus(context.Background(), vm).
+		Return(fmt.Errorf("error waiting for agent: %w", lutherproxmox.ErrTimeout)).Once()
+	// no CloudInitStatus expectation: the cloud-init check must not run without the agent
+
+	requeue, err := checkCloudInitStatus(context.Background(), machineScope)
+	require.True(t, requeue)
+	var requeueErr *taskservice.RequeueError
+	require.ErrorAs(t, err, &requeueErr)
+	require.Equal(t, infrav1.DefaultReconcilerRequeue, requeueErr.RequeueAfter())
+	require.Equal(t, infrav1.ProxmoxMachineVirtualMachineProvisionedWaitingForCloudInitReason,
+		conditions.GetReason(machineScope.ProxmoxMachine, infrav1.ProxmoxMachineVirtualMachineProvisionedCondition))
+}
+
+// cloud-init >= 23.4 exits 2 when it finished with recoverable errors. The guest is configured
+// and joins, so the machine moves on; the warning is kept in the condition message.
+func TestReconcileVM_CloudInitRecoverableErrorsMoveOn(t *testing.T) {
+	machineScope, proxmoxClient, _ := setupReconcilerTestWithCondition(t, infrav1.ProxmoxMachineVirtualMachineProvisionedWaitingForCloudInitReason)
+	vm := newRunningVM()
+	machineScope.SetVirtualMachineID(int64(vm.VMID))
+	machineScope.ProxmoxMachine.Status.BootstrapDataProvided = new(true)
+	machineScope.ProxmoxMachine.Status.Initialization.Provisioned = new(true)
+
+	warning := fmt.Errorf("%w (exit code 2): status: done", goproxmox.ErrCloudInitRecoverable)
+	proxmoxClient.EXPECT().GetVM(context.Background(), "node1", int64(123)).Return(vm, nil).Once()
+	proxmoxClient.EXPECT().QemuAgentStatus(context.Background(), vm).Return(nil).Once()
+	proxmoxClient.EXPECT().CloudInitStatus(context.Background(), vm).Return(false, warning).Once()
+
+	result, err := ReconcileVM(context.Background(), machineScope)
+	require.NoError(t, err)
+	require.Equal(t, infrav1.VirtualMachineStateReady, result.State)
+	require.False(t, machineScope.HasFailed())
+
+	cond := conditions.Get(machineScope.ProxmoxMachine, infrav1.ProxmoxMachineVirtualMachineProvisionedCondition)
+	require.NotNil(t, cond)
+	require.Equal(t, infrav1.ProxmoxMachineVirtualMachineProvisionedWaitingForBootstrapReadyReason, cond.Reason)
+	require.Equal(t, warning.Error(), cond.Message)
+}
+
 func TestReconcileVM_CloudInitFailedWrapped(t *testing.T) {
 	machineScope, proxmoxClient, _ := setupReconcilerTestWithCondition(t, infrav1.ProxmoxMachineVirtualMachineProvisionedWaitingForCloudInitReason)
 	vm := newRunningVM()
@@ -962,6 +1095,7 @@ func TestReconcileVM_StateMachine(t *testing.T) {
 	proxmoxClient.EXPECT().GetReservableMemoryBytes(context.Background(), "node2", int64(100)).Return(^uint64(0), nil).Once()
 	proxmoxClient.EXPECT().CloneVM(context.Background(), 123, proxmox.VMCloneRequest{
 		Node:        "node1",
+		NewID:       100,
 		Name:        "test",
 		Description: "test vm",
 		Format:      "raw",
@@ -1129,4 +1263,58 @@ func TestReconcileVM_StateMachine(t *testing.T) {
 	require.Equal(t, machineScope.ProxmoxMachine.GetName(), machineScope.ProxmoxMachine.Status.Addresses[0].Address)
 	require.Equal(t, "192.0.2.10", machineScope.ProxmoxMachine.Status.Addresses[1].Address)
 	require.Equal(t, "2001:db8::2", machineScope.ProxmoxMachine.Status.Addresses[2].Address)
+}
+
+func TestCloudInitISODevice(t *testing.T) {
+	iso := "local:iso/user-data-123.iso,media=cdrom"
+	tests := []struct {
+		name string
+		cfg  *lutherproxmox.VirtualMachineConfig
+		want string
+	}{
+		{"no config", nil, "ide0"},
+		{"x86 without ISO falls back to ide0", &lutherproxmox.VirtualMachineConfig{SCSIs: map[string]string{"scsi0": "local-lvm:vm-123-disk-0,size=20G"}}, "ide0"},
+		{"ISO on ide0", &lutherproxmox.VirtualMachineConfig{IDEs: map[string]string{"ide0": iso}}, "ide0"},
+		{"ISO on ide2", &lutherproxmox.VirtualMachineConfig{IDEs: map[string]string{"ide2": iso}, SCSIs: map[string]string{"scsi0": "local-lvm:vm-123-disk-0,size=20G"}}, "ide2"},
+		{"ISO on scsi1 of an aarch64 VM", &lutherproxmox.VirtualMachineConfig{Machine: "virt", SCSIs: map[string]string{"scsi0": "local-lvm:vm-123-disk-0,size=20G", "scsi1": iso}}, "scsi1"},
+		{"ISO on sata0", &lutherproxmox.VirtualMachineConfig{SATAs: map[string]string{"sata0": "nfs:iso/user-data-123.iso,media=cdrom,size=4M"}}, "sata0"},
+		{"another VM's ISO does not count", &lutherproxmox.VirtualMachineConfig{IDEs: map[string]string{"ide2": "local:iso/user-data-1234.iso,media=cdrom"}, SCSIs: map[string]string{"scsi1": iso}}, "scsi1"},
+		{"a cloud-init drive is not the ISO", &lutherproxmox.VirtualMachineConfig{IDEs: map[string]string{"ide2": "local-lvm:vm-123-cloudinit,media=cdrom"}}, "ide0"},
+		{"aarch64 without ISO falls back to the injector's slot", &lutherproxmox.VirtualMachineConfig{Machine: "virt", SCSIs: map[string]string{"scsi0": "local-lvm:vm-123-disk-0,size=20G"}}, "scsi1"},
+		{"lowest device wins on several matches", &lutherproxmox.VirtualMachineConfig{IDEs: map[string]string{"ide2": iso}, SCSIs: map[string]string{"scsi1": iso}}, "ide2"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			vm := &lutherproxmox.VirtualMachine{VMID: 123, VirtualMachineConfig: tc.cfg}
+			require.Equal(t, tc.want, cloudInitISODevice(vm))
+		})
+	}
+	require.Equal(t, "ide0", cloudInitISODevice(nil))
+}
+
+func TestReconcileDisks_UnmountCloudInitISO_FindsDevice(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		setup  func(cfg *lutherproxmox.VirtualMachineConfig)
+		device string
+	}{
+		{"scsi1 on aarch64", func(cfg *lutherproxmox.VirtualMachineConfig) {
+			cfg.Machine = "virt"
+			cfg.SCSIs = map[string]string{"scsi0": "local-lvm:vm-123-disk-0,size=20G", "scsi1": "local:iso/user-data-123.iso,media=cdrom"}
+		}, "scsi1"},
+		{"ide2 on x86", func(cfg *lutherproxmox.VirtualMachineConfig) {
+			cfg.IDEs = map[string]string{"ide2": "local:iso/user-data-123.iso,media=cdrom"}
+		}, "ide2"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			machineScope, proxmoxClient, _ := setupReconcilerTestWithCondition(t, infrav1.ProxmoxMachineVirtualMachineProvisionedWaitingForBootstrapReadyReason)
+			vm := newRunningVM()
+			tc.setup(vm.VirtualMachineConfig)
+			machineScope.SetVirtualMachine(vm)
+
+			proxmoxClient.EXPECT().UnmountCloudInitISO(context.Background(), vm, tc.device).Return(nil)
+
+			require.NoError(t, unmountCloudInitISO(context.Background(), machineScope))
+		})
+	}
 }

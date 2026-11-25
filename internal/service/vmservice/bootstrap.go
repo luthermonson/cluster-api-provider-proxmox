@@ -38,6 +38,7 @@ import (
 	"github.com/ionos-cloud/cluster-api-provider-proxmox/internal/inject"
 	"github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/cloudinit"
 	"github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/ignition"
+	"github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/kubernetes/ipam"
 	"github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/network"
 	"github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/scope"
 )
@@ -59,10 +60,12 @@ func reconcileBootstrapData(ctx context.Context, machineScope *scope.MachineScop
 	// Get the bootstrap data.
 	bootstrapData, format, err := getBootstrapData(ctx, machineScope)
 	if err != nil {
+		// Keep the machine in this step so the next reconcile retries. Any other reason would
+		// make every step skip and the machine be reported ready without bootstrap data.
 		conditions.Set(machineScope.ProxmoxMachine, metav1.Condition{
 			Type:    infrav1.ProxmoxMachineVirtualMachineProvisionedCondition,
 			Status:  metav1.ConditionFalse,
-			Reason:  infrav1.ProxmoxMachineVirtualMachineProvisionedCloningFailedReason,
+			Reason:  infrav1.ProxmoxMachineVirtualMachineProvisionedWaitingForBootstrapDataReconciliationReason,
 			Message: err.Error(),
 		})
 		return false, err
@@ -222,7 +225,7 @@ func getNetworkConfigData(ctx context.Context, machineScope *scope.MachineScope)
 	return networkConfigData, nil
 }
 
-func getNetworkConfigDataForDevice(ctx context.Context, machineScope *scope.MachineScope, device infrav1.NetName, ipPoolRefs map[corev1.TypedLocalObjectReference][]ipamv1.IPAddress) (*network.ConfigData, error) {
+func getNetworkConfigDataForDevice(ctx context.Context, machineScope *scope.MachineScope, device infrav1.NetName, ipPoolRefs map[ipam.PoolKey][]ipamv1.IPAddress) (*network.ConfigData, error) {
 	if device == "" {
 		// this should never happen outwith tests
 		return nil, errors.New("empty device name")
@@ -315,7 +318,7 @@ func getCommonInterfaceConfig(_ context.Context, _ *scope.MachineScope, ciconfig
 
 func getNetworkDevices(ctx context.Context, machineScope *scope.MachineScope, networkSpec infrav1.NetworkSpec) ([]network.ConfigData, error) {
 	networkConfigData := make([]network.ConfigData, 0, len(networkSpec.NetworkDevices))
-	ipAddressMap := make(map[infrav1.NetName]map[corev1.TypedLocalObjectReference][]ipamv1.IPAddress)
+	ipAddressMap := make(map[infrav1.NetName]map[ipam.PoolKey][]ipamv1.IPAddress)
 
 	requeue, err := handleDevices(ctx, machineScope, ipAddressMap)
 	if requeue || err != nil {
