@@ -18,6 +18,7 @@ package vmservice
 
 import (
 	"context"
+	"slices"
 	"strings"
 
 	"github.com/luthermonson/go-proxmox"
@@ -30,11 +31,43 @@ import (
 
 	infrav1 "github.com/ionos-cloud/cluster-api-provider-proxmox/api/v1alpha2"
 	"github.com/ionos-cloud/cluster-api-provider-proxmox/internal/service/taskservice"
+	capmox "github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/proxmox"
 	"github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/scope"
 )
 
 // errVMNotOwned means the recorded VMID is free, or holds a container or another machine's VM.
 var errVMNotOwned = errors.New("vmid is not held by this machine's vm")
+
+// DeletingTag is the tag set on a VM together with the deletion hookscript (see
+// ProxmoxClusterSpec.DeletionHookScript); the script acts only on VMs carrying it.
+const DeletingTag = "deleting"
+
+// deletionHookArmed reports whether vm already carries the hookscript and the deleting tag.
+func deletionHookArmed(vm *proxmox.VirtualMachine, hook string) bool {
+	if vm.VirtualMachineConfig == nil || vm.VirtualMachineConfig.Hookscript != hook {
+		return false
+	}
+	return slices.Contains(strings.Split(vmTags(vm), ";"), DeletingTag)
+}
+
+// vmTags returns the VM's tags as Proxmox stores them (semicolon separated), or "".
+func vmTags(vm *proxmox.VirtualMachine) string {
+	if vm.VirtualMachineConfig == nil {
+		return ""
+	}
+	return vm.VirtualMachineConfig.Tags
+}
+
+// withTag appends tag to a semicolon separated tag list unless it is already there.
+func withTag(tags, tag string) string {
+	if tags == "" {
+		return tag
+	}
+	if slices.Contains(strings.Split(tags, ";"), tag) {
+		return tags
+	}
+	return tags + ";" + tag
+}
 
 // DeleteVM destroys the machine's VM one Proxmox task per reconcile: a stop while the VM
 // runs, then the destroy, and finally the check that the VMID is free again. Each task is
@@ -115,6 +148,26 @@ func DeleteVM(ctx context.Context, machineScope *scope.MachineScope) (requeue bo
 
 	client := machineScope.InfraCluster.ProxmoxClient
 	if vm.Status != proxmox.StatusVirtualMachineStopped {
+		// With a deletion hookscript configured, arm it before the stop: Proxmox then runs it
+		// on the host after the VM has stopped and the script destroys the VM, which also
+		// covers the last VM of a self-hosted cluster, where the provider dies with the stop.
+		if hook := machineScope.InfraCluster.ProxmoxCluster.Spec.DeletionHookScript; hook != "" && !deletionHookArmed(vm, hook) {
+			opts := []capmox.VirtualMachineOption{
+				{Name: "hookscript", Value: hook},
+				{Name: "tags", Value: withTag(vmTags(vm), DeletingTag)},
+			}
+			task, err := client.ConfigureVM(ctx, vm, opts...)
+			if err != nil {
+				markDeletionFailed(machineScope, err)
+				return false, err
+			}
+			machineScope.Info("arming the deletion hookscript", "vmID", vmID, "node", vm.Node, "hookscript", hook)
+			if task != nil {
+				machineScope.ProxmoxMachine.Status.TaskRef = new(string(task.UPID))
+			}
+			markDeleting(machineScope, true)
+			return true, nil
+		}
 		task, err := client.StopVM(ctx, vm)
 		if err != nil {
 			markDeletionFailed(machineScope, err)

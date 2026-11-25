@@ -61,6 +61,17 @@ type ProxmoxClusterSpec struct {
 	// +optional
 	SchedulerHints *SchedulerHints `json:"schedulerHints,omitempty"`
 
+	// deletionHookScript is the volume ID of a Proxmox hookscript, for example
+	// "local:snippets/destroy.sh", that the provider sets on every VM right before it is
+	// stopped for deletion, together with the tag "deleting". Proxmox runs the script on the
+	// host once the VM has stopped, where it can destroy the VM even when the provider is no
+	// longer running: that is the situation of the last VM of a cluster hosting its own
+	// management plane, which the provider stops and dies with. A VM that is gone when the
+	// provider looks again is treated as deleted; a VM that is still there is destroyed by
+	// the provider as usual. The script must exist on every node that can run the VMs.
+	// +optional
+	DeletionHookScript string `json:"deletionHookScript,omitempty"`
+
 	// ipv4Config contains information about available IPv4 address pools and the gateway.
 	// This can be combined with ipv6Config in order to enable dual stack.
 	// Either IPv4Config or IPv6Config must be provided.

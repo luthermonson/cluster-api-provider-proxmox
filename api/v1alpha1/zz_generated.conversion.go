@@ -877,6 +877,7 @@ func autoConvert_v1alpha2_ProxmoxClusterSpec_To_v1alpha1_ProxmoxClusterSpec(in *
 	} else {
 		out.SchedulerHints = nil
 	}
+	// WARNING: in.DeletionHookScript requires manual conversion: does not exist in peer-type
 	if in.IPv4Config != nil {
 		in, out := &in.IPv4Config, &out.IPv4Config
 		*out = new(IPConfigSpec)
