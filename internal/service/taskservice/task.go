@@ -139,12 +139,23 @@ func checkAndRetryTask(scope *scope.MachineScope, task *proxmox.Task) (bool, err
 			if conditionReason == "" {
 				conditionReason = infrav1.ProxmoxMachineVirtualMachineProvisionedWaitingForVMPowerUpReason
 			}
-		case task.Type == "resize" && strings.Contains(task.ExitStatus, "does not exist"):
-			// The disk is there (the clone made it) but the node running the resize
-			// cannot see it yet: on shared storage a directory cache can lag a VM
-			// that was destroyed and recreated under the same ID. Go back to the disk
-			// step so the resize is issued again after RetryAfter; starting the VM
-			// with the template's disk would only move the failure into the guest.
+		case task.Type == "resize" && strings.HasPrefix(task.ExitStatus, "volume '") && strings.Contains(task.ExitStatus, "does not exist"):
+			// PVE forks the resize worker as "resize" (qemu-server Qemu.pm:
+			// fork_worker('resize', ...)), not "qmresize" — resize is the exception to the
+			// qm* worker naming, so the task type we match here must be "resize".
+			//
+			// The disk is there (the clone made it) but the node running the resize cannot
+			// see it yet: on shared storage a directory cache can lag a VM that was destroyed
+			// and recreated under the same ID, so the resize fails with
+			// "volume '<storage>:<id>/vm-<id>-disk-0.qcow2' does not exist". Go back to the
+			// disk step so the resize is issued again after RetryAfter; starting the VM with
+			// the template's disk would only move the failure into the guest (it runs out of
+			// space). Other resize failures stay terminal.
+			//
+			// The match is deliberately anchored on the "volume '" prefix: PVE's resize
+			// handler emits the same "does not exist" wording for a misconfigured
+			// bootVolume.disk ("disk '<x>' does not exist"), which is a terminal user error
+			// and must NOT be retried.
 			logger.Info("resize failed because the volume is not visible yet; retrying", "exitStatus", task.ExitStatus)
 			conditionReason = infrav1.ProxmoxMachineVirtualMachineProvisionedWaitingForDiskReconciliationReason
 		case task.Type == taskTypeStopVM || task.Type == taskTypeDestroyVM:
