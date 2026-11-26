@@ -984,6 +984,26 @@ func TestCheckCloudInitStatus_AgentNotReadyRequeues(t *testing.T) {
 		conditions.GetReason(machineScope.ProxmoxMachine, infrav1.ProxmoxMachineVirtualMachineProvisionedCondition))
 }
 
+// A non-timeout agent error (for example an authentication failure) is a real problem and must
+// reach the controller's error path rather than being masked as a routine timed requeue.
+func TestCheckCloudInitStatus_AgentNonTimeoutErrors(t *testing.T) {
+	machineScope, proxmoxClient, _ := setupReconcilerTestWithCondition(t, infrav1.ProxmoxMachineVirtualMachineProvisionedWaitingForCloudInitReason)
+	vm := newRunningVM()
+	machineScope.SetVirtualMachine(vm)
+
+	authErr := fmt.Errorf("error waiting for agent: %w", fmt.Errorf("401 authentication failure"))
+	proxmoxClient.EXPECT().QemuAgentStatus(context.Background(), vm).Return(authErr).Once()
+	// no CloudInitStatus expectation: the cloud-init check must not run without the agent
+
+	requeue, err := checkCloudInitStatus(context.Background(), machineScope)
+	require.False(t, requeue)
+	require.Error(t, err)
+	// It is a plain error, not a timed requeue.
+	var requeueErr *taskservice.RequeueError
+	require.NotErrorAs(t, err, &requeueErr)
+	require.Contains(t, err.Error(), "authentication failure")
+}
+
 // cloud-init >= 23.4 exits 2 when it finished with recoverable errors. The guest is configured
 // and joins, so the machine moves on; the warning is kept in the condition message.
 func TestReconcileVM_CloudInitRecoverableErrorsMoveOn(t *testing.T) {
@@ -1282,6 +1302,9 @@ func TestCloudInitISODevice(t *testing.T) {
 		{"a cloud-init drive is not the ISO", &lutherproxmox.VirtualMachineConfig{IDEs: map[string]string{"ide2": "local-lvm:vm-123-cloudinit,media=cdrom"}}, "ide0"},
 		{"aarch64 without ISO falls back to the injector's slot", &lutherproxmox.VirtualMachineConfig{Machine: "virt", SCSIs: map[string]string{"scsi0": "local-lvm:vm-123-disk-0,size=20G"}}, "scsi1"},
 		{"lowest device wins on several matches", &lutherproxmox.VirtualMachineConfig{IDEs: map[string]string{"ide2": iso}, SCSIs: map[string]string{"scsi1": iso}}, "ide2"},
+		// After a detach whose ISO delete failed, the slot is left "none,media=cdrom". Reuse
+		// it rather than allocating a new free slot (which would leak another empty CD-ROM).
+		{"detached ISO reuses the emptied cdrom slot", &lutherproxmox.VirtualMachineConfig{Machine: "virt", SCSIs: map[string]string{"scsi0": "local-lvm:vm-123-disk-0,size=20G", "scsi1": "none,media=cdrom"}}, "scsi1"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
