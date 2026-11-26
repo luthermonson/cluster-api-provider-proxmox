@@ -929,3 +929,48 @@ func TestProxmoxAPIClient_NextID(t *testing.T) {
 		require.Contains(t, err.Error(), "next free vmid")
 	})
 }
+
+// TestProxmoxAPIClient_CheckID guards the go-proxmox v0.12.0 bump (upstream #972). CheckID asks
+// /cluster/nextid?vmid=<id>; a taken ID comes back as a 400 whose "errors.vmid" field names the
+// clash. pve-manager 9.2.31 reworded that message from "VM N already exists" to "guest ID N is
+// already in use", and go-proxmox v0.12.0 recognises both, so a taken ID is reported as not-free
+// (free=false, no error) rather than surfaced as a hard failure that stalls the delete path.
+func TestProxmoxAPIClient_CheckID(t *testing.T) {
+	const vmID = 101
+
+	t.Run("free id", func(t *testing.T) {
+		client := newTestClient(t)
+		httpmock.RegisterResponder(http.MethodGet, `=~/cluster/status`,
+			newJSONResponder(200, proxmox.NodeStatuses{{Name: "test"}}))
+		httpmock.RegisterResponder(http.MethodGet, `=~/cluster/nextid`,
+			newJSONResponder(200, fmt.Sprintf("%d", vmID)))
+
+		free, err := client.CheckID(context.Background(), vmID)
+		require.NoError(t, err)
+		require.True(t, free, "an id the cluster hands back is free")
+	})
+
+	wordings := []struct {
+		name   string
+		format string
+	}{
+		{name: "legacy wording", format: "VM %d already exists"},
+		{name: "pve 9.2.31 wording", format: "guest ID %d is already in use"},
+	}
+	for _, wording := range wordings {
+		t.Run("taken id/"+wording.name, func(t *testing.T) {
+			client := newTestClient(t)
+			httpmock.RegisterResponder(http.MethodGet, `=~/cluster/status`,
+				newJSONResponder(200, proxmox.NodeStatuses{{Name: "test"}}))
+			httpmock.RegisterResponder(http.MethodGet, `=~/cluster/nextid`,
+				httpmock.NewJsonResponderOrPanic(400, map[string]any{
+					"data":   nil,
+					"errors": map[string]any{"vmid": fmt.Sprintf(wording.format, vmID)},
+				}))
+
+			free, err := client.CheckID(context.Background(), vmID)
+			require.NoError(t, err, "a taken id is not an error, just not free")
+			require.False(t, free, "a taken id must report free=false for both PVE wordings")
+		})
+	}
+}
